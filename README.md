@@ -25,7 +25,7 @@ npm install
 pnpm install
 # or
 yarn install
-```
+``` 
 
 2. Run the development server:
 ```bash

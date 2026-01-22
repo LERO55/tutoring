@@ -1,293 +1,591 @@
 'use client';
 
-import { useState, useEffect, useMemo } from 'react';
-import TutorCard from '@/components/TutorCard';
-import BookingModal from '@/components/BookingModal';
-import SearchBar from '@/components/SearchBar';
-import TutorProfile from '@/components/TutorProfile';
-import { tutors, subjectIcons, categoryColors, getInitials, getPopularSubjects, type SubjectCategory } from '@/data/tutors';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useAuth } from '@/components/AuthProvider';
+import { tutors, getInitials, subjectIcons } from '@/data/tutors';
+import { getSuggestedSlots, createCalendarEvent, formatSlotTime } from '@/lib/calendar';
 
-interface UserInfo {
-  name: string;
-  email: string;
-  favoriteSubjects?: string[];
+type Screen = 'welcome' | 'home' | 'matching' | 'tutor' | 'booking' | 'confirmed' | 'session' | 'feedback';
+
+interface UserPrefs {
+  lastTutorId?: string;
+  lastSubject?: string;
+  favoriteSubjects: string[];
+  sessionCount: number;
+  lastQuery?: string;
 }
 
-interface BookingHistory {
-  tutorId: string;
-  subject: string;
-  date: string;
+interface MatchedTutor {
+  tutor: typeof tutors[0];
+  relevance: number;
+  reason: string;
 }
 
-type CategoryFilter = 'all' | SubjectCategory;
+interface Toast {
+  id: string;
+  message: string;
+  type: 'success' | 'error';
+}
 
-const CATEGORY_LABELS: Record<CategoryFilter, string> = {
-  all: 'All Subjects',
-  stem: 'STEM',
-  languages: 'Languages',
-  social: 'Social Sciences',
-  arts: 'Arts',
-};
+const PLACEHOLDERS = [
+  "GCSE Maths exam tomorrow",
+  "Help with Spanish homework", 
+  "Physics problem sets",
+  "Essay writing feedback",
+];
 
-// Get unique subjects with their tutors
-const getSubjectsWithTutors = () => {
-  const subjectMap = new Map<string, typeof tutors>();
+function findBestMatch(query: string, prefs: UserPrefs): MatchedTutor {
+  const queryLower = query.toLowerCase();
   
-  tutors.forEach(tutor => {
-    if (!subjectMap.has(tutor.subject)) {
-      subjectMap.set(tutor.subject, []);
+  const scored = tutors.map(tutor => {
+    let score = 0;
+    let reason = '';
+    
+    if (tutor.subject.toLowerCase().includes(queryLower) || 
+        queryLower.includes(tutor.subject.toLowerCase())) {
+      score += 50;
+      reason = `Expert in ${tutor.subject}`;
     }
-    subjectMap.get(tutor.subject)!.push(tutor);
+    
+    const keywords = queryLower.split(' ');
+    keywords.forEach(word => {
+      if (tutor.subject.toLowerCase().includes(word)) score += 20;
+      if (tutor.expertise.toLowerCase().includes(word)) score += 15;
+    });
+    
+    if (tutor.available && tutor.availableIn === 'Available now') {
+      score += 30;
+      if (!reason) reason = 'Available right now';
+    }
+    
+    score += tutor.rating * 5;
+    
+    if (prefs.lastTutorId === tutor.id) {
+      score += 15;
+      reason = 'Your previous tutor';
+    }
+    
+    return { tutor, relevance: score, reason: reason || `${tutor.rating}★ • ${tutor.sessionsCompleted} sessions` };
   });
+  
+  scored.sort((a, b) => b.relevance - a.relevance);
+  return scored[0];
+}
 
-  return Array.from(subjectMap.entries()).map(([subject, subjectTutors]) => {
-    const topTutor = subjectTutors.reduce((best, current) => 
-      current.rating > best.rating ? current : best
-    );
-    return {
-      subject,
-      tutorCount: subjectTutors.length,
-      tutors: subjectTutors,
-      topTutor,
-      category: topTutor.category,
-    };
-  }).sort((a, b) => a.subject.localeCompare(b.subject));
-};
+function getAvailableCount(): number {
+  return tutors.filter(t => t.available).length;
+}
+
+// Toast component
+function ToastNotification({ toast, onDismiss }: { toast: Toast; onDismiss: () => void }) {
+  useEffect(() => {
+    const timer = setTimeout(onDismiss, 3000);
+    return () => clearTimeout(timer);
+  }, [onDismiss]);
+
+  return (
+    <div className={`toast animate-toast-in ${toast.type === 'success' ? 'toast-success' : 'toast-error'}`}>
+      <span className="flex items-center gap-2">
+        {toast.type === 'success' ? (
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+          </svg>
+        ) : (
+          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+          </svg>
+        )}
+        {toast.message}
+      </span>
+    </div>
+  );
+}
+
+// Star rating component
+function StarRating({ rating, onRate }: { rating: number; onRate: (r: number) => void }) {
+  const [hovered, setHovered] = useState(0);
+  
+  return (
+    <div className="flex gap-2">
+      {[1, 2, 3, 4, 5].map((star) => (
+        <button
+          key={star}
+          onClick={() => onRate(star)}
+          onMouseEnter={() => setHovered(star)}
+          onMouseLeave={() => setHovered(0)}
+          className="w-12 h-12 rounded-xl bg-neutral-100 flex items-center justify-center text-2xl transition-all hover:bg-neutral-200 hover:scale-105 active:scale-95"
+        >
+          <span className={(hovered >= star || rating >= star) ? 'opacity-100' : 'opacity-30'}>
+            ★
+          </span>
+        </button>
+      ))}
+    </div>
+  );
+}
 
 export default function Home() {
-  const [showLanding, setShowLanding] = useState(true);
-  const [onboardingStep, setOnboardingStep] = useState<'name' | 'subjects'>('name');
-  const [userInfo, setUserInfo] = useState<UserInfo>({ name: '', email: '' });
-  const [tempSelectedSubjects, setTempSelectedSubjects] = useState<string[]>([]);
-  const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('all');
-  const [selectedSubject, setSelectedSubject] = useState<string | null>(null);
-  const [selectedTutor, setSelectedTutor] = useState<typeof tutors[0] | null>(null);
-  const [viewingTutor, setViewingTutor] = useState<typeof tutors[0] | null>(null);
-  const [isModalOpen, setIsModalOpen] = useState(false);
-  const [isInstantBook, setIsInstantBook] = useState(false);
-  const [recentTutors, setRecentTutors] = useState<typeof tutors>([]);
-  const [bookingHistory, setBookingHistory] = useState<BookingHistory[]>([]);
-
-  const subjectsWithTutors = useMemo(() => getSubjectsWithTutors(), []);
-  const popularSubjects = useMemo(() => getPopularSubjects(), []);
+  const { isAuthenticated, user, login, logout, inProgress, msalInstance } = useAuth();
   
-  const filteredSubjects = useMemo(() => {
-    if (categoryFilter === 'all') return subjectsWithTutors;
-    return subjectsWithTutors.filter(s => s.category === categoryFilter);
-  }, [subjectsWithTutors, categoryFilter]);
+  const [screen, setScreen] = useState<Screen>('welcome');
+  const [query, setQuery] = useState('');
+  const [placeholderIndex, setPlaceholderIndex] = useState(0);
+  const [matchedTutor, setMatchedTutor] = useState<MatchedTutor | null>(null);
+  const [selectedTime, setSelectedTime] = useState<Date | null>(null);
+  const [prefs, setPrefs] = useState<UserPrefs>({
+    favoriteSubjects: [],
+    sessionCount: 0,
+  });
+  const [freeSlots, setFreeSlots] = useState<Date[]>([]);
+  const [loadingSlots, setLoadingSlots] = useState(false);
+  const [creatingEvent, setCreatingEvent] = useState(false);
+  const [calendarEventId, setCalendarEventId] = useState<string | null>(null);
+  const [sessionTimer, setSessionTimer] = useState(0);
+  const [feedbackRating, setFeedbackRating] = useState(0);
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const inputRef = useRef<HTMLInputElement>(null);
 
-  const filteredTutors = useMemo(() => {
-    if (!selectedSubject) return [];
-    return tutors.filter(t => t.subject === selectedSubject);
-  }, [selectedSubject]);
+  // Toast helper
+  const showToast = useCallback((message: string, type: 'success' | 'error' = 'success') => {
+    const id = Math.random().toString(36);
+    setToasts(prev => [...prev, { id, message, type }]);
+  }, []);
 
+  const dismissToast = useCallback((id: string) => {
+    setToasts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
+  // Check auth state
   useEffect(() => {
-    const savedUserInfo = localStorage.getItem('tutoringUserInfo');
-    const savedRecentTutors = localStorage.getItem('tutoringRecentTutors');
-    const savedBookings = localStorage.getItem('tutoringBookings');
-    
-    if (savedUserInfo) {
-      const parsed = JSON.parse(savedUserInfo);
-      setUserInfo(parsed);
-      setShowLanding(false);
+    if (isAuthenticated && user) {
+      setScreen('home');
     }
-    if (savedRecentTutors) {
-      const tutorIds = JSON.parse(savedRecentTutors);
-      const recent = tutorIds.map((id: string) => tutors.find(t => t.id === id)).filter(Boolean);
-      setRecentTutors(recent);
-    }
-    if (savedBookings) {
-      setBookingHistory(JSON.parse(savedBookings));
+  }, [isAuthenticated, user]);
+
+  // Load prefs
+  useEffect(() => {
+    const savedPrefs = localStorage.getItem('tutorPrefs');
+    if (savedPrefs) {
+      setPrefs(JSON.parse(savedPrefs));
     }
   }, []);
 
-  const trackRecentTutor = (tutor: typeof tutors[0]) => {
-    setRecentTutors(prev => {
-      const filtered = prev.filter(t => t.id !== tutor.id);
-      const updated = [tutor, ...filtered].slice(0, 3);
-      localStorage.setItem('tutoringRecentTutors', JSON.stringify(updated.map(t => t.id)));
-      return updated;
-    });
-  };
+  // Rotate placeholders
+  useEffect(() => {
+    if (screen !== 'home') return;
+    const interval = setInterval(() => {
+      setPlaceholderIndex(i => (i + 1) % PLACEHOLDERS.length);
+    }, 3000);
+    return () => clearInterval(interval);
+  }, [screen]);
 
-  const handleSubjectClick = (subjectData: typeof subjectsWithTutors[0]) => {
-    if (subjectData.tutorCount === 1) {
-      setSelectedTutor(subjectData.topTutor);
-      trackRecentTutor(subjectData.topTutor);
-      setIsModalOpen(true);
-    } else {
-      setSelectedSubject(subjectData.subject);
+  // Session timer
+  useEffect(() => {
+    if (screen !== 'session') {
+      setSessionTimer(0);
+      return;
     }
-  };
+    const interval = setInterval(() => {
+      setSessionTimer(t => t + 1);
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [screen]);
 
-  const handleViewProfile = (tutor: typeof tutors[0]) => {
-    setViewingTutor(tutor);
-    trackRecentTutor(tutor);
-  };
-
-  const handleBookTutor = (tutor: typeof tutors[0], instant = false) => {
-    setSelectedTutor(tutor);
-    setIsInstantBook(instant);
-    trackRecentTutor(tutor);
-    setIsModalOpen(true);
-    setViewingTutor(null);
-  };
-
-  const handleCloseModal = () => {
-    setIsModalOpen(false);
-    setSelectedTutor(null);
-    setIsInstantBook(false);
-  };
-
-  const handleBookingComplete = (tutor: typeof tutors[0]) => {
-    const newBooking: BookingHistory = {
-      tutorId: tutor.id,
-      subject: tutor.subject,
-      date: new Date().toISOString(),
-    };
-    const updated = [newBooking, ...bookingHistory].slice(0, 10);
-    setBookingHistory(updated);
-    localStorage.setItem('tutoringBookings', JSON.stringify(updated));
-  };
-
-  const handleSearchSelectTutor = (tutor: typeof tutors[0]) => {
-    handleViewProfile(tutor);
-  };
-
-  const handleSearchSelectSubject = (subject: string) => {
-    const subjectData = subjectsWithTutors.find(s => s.subject === subject);
-    if (subjectData) {
-      handleSubjectClick(subjectData);
+  // Focus input on home
+  useEffect(() => {
+    if (screen === 'home' && inputRef.current) {
+      setTimeout(() => inputRef.current?.focus(), 100);
     }
+  }, [screen]);
+
+  const formatTimer = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
-  const handleLandingSubmit = (e: React.FormEvent<HTMLFormElement>) => {
-    e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    const name = formData.get('name') as string;
+  const savePrefs = useCallback((updates: Partial<UserPrefs>) => {
+    const newPrefs = { ...prefs, ...updates };
+    setPrefs(newPrefs);
+    localStorage.setItem('tutorPrefs', JSON.stringify(newPrefs));
+  }, [prefs]);
+
+  const handleLogin = async () => {
+    await login();
+  };
+
+  const handleLogout = () => {
+    localStorage.removeItem('tutorPrefs');
+    logout();
+    setScreen('welcome');
+  };
+
+  const handleSubmit = () => {
+    if (!query.trim()) return;
+    savePrefs({ lastQuery: query });
+    setScreen('matching');
     
-    setUserInfo(prev => ({ ...prev, name }));
-    setOnboardingStep('subjects');
+    setTimeout(() => {
+      const match = findBestMatch(query, prefs);
+      setMatchedTutor(match);
+      setScreen('tutor');
+    }, 800);
   };
 
-  const handleSubjectsSubmit = (selectedSubjects: string[]) => {
-    const info = { ...userInfo, favoriteSubjects: selectedSubjects };
-    setUserInfo(info);
-    localStorage.setItem('tutoringUserInfo', JSON.stringify(info));
-    setShowLanding(false);
+  const handleQuickRebook = () => {
+    if (prefs.lastTutorId) {
+      const lastTutor = tutors.find(t => t.id === prefs.lastTutorId);
+      if (lastTutor) {
+        setMatchedTutor({
+          tutor: lastTutor,
+          relevance: 100,
+          reason: 'Your previous tutor',
+        });
+        setScreen('tutor');
+      }
+    }
   };
 
-  const handleSkipSubjects = () => {
-    localStorage.setItem('tutoringUserInfo', JSON.stringify(userInfo));
-    setShowLanding(false);
+  const handleBook = async (instant = false) => {
+    if (instant) {
+      const now = new Date();
+      setSelectedTime(now);
+      await completeBooking(now);
+    } else {
+      setScreen('booking');
+      setLoadingSlots(true);
+      
+      if (msalInstance) {
+        try {
+          const slots = await getSuggestedSlots(msalInstance, 60, 5);
+          setFreeSlots(slots);
+        } catch (error) {
+          console.error('Failed to get calendar slots:', error);
+          const now = new Date();
+          const fallbackSlots = [
+            new Date(now.getTime() + 30 * 60000),
+            new Date(now.getTime() + 60 * 60000),
+            new Date(now.getTime() + 120 * 60000),
+            new Date(now.getTime() + 180 * 60000),
+            new Date(now.getTime() + 240 * 60000),
+          ];
+          setFreeSlots(fallbackSlots);
+        }
+      } else {
+        const now = new Date();
+        setFreeSlots([
+          new Date(now.getTime() + 30 * 60000),
+          new Date(now.getTime() + 60 * 60000),
+          new Date(now.getTime() + 120 * 60000),
+          new Date(now.getTime() + 180 * 60000),
+          new Date(now.getTime() + 240 * 60000),
+        ]);
+      }
+      
+      setLoadingSlots(false);
+    }
   };
 
-  const toggleSubject = (subject: string) => {
-    setTempSelectedSubjects(prev => 
-      prev.includes(subject) 
-        ? prev.filter(s => s !== subject)
-        : prev.length < 3 ? [...prev, subject] : prev
-    );
+  const handleTimeSelect = async (time: Date) => {
+    setSelectedTime(time);
+    await completeBooking(time);
   };
 
-  // Landing Screen - Name Input
-  if (showLanding && onboardingStep === 'name') {
+  const completeBooking = async (startTime: Date) => {
+    setScreen('confirmed');
+    setCreatingEvent(true);
+    setCalendarEventId(null);
+    
+    if (matchedTutor) {
+      savePrefs({
+        lastTutorId: matchedTutor.tutor.id,
+        lastSubject: matchedTutor.tutor.subject,
+        sessionCount: prefs.sessionCount + 1,
+      });
+      
+      if (msalInstance) {
+        try {
+          const endTime = new Date(startTime.getTime() + 60 * 60000);
+          const event = await createCalendarEvent(msalInstance, {
+            subject: `Tutoring: ${matchedTutor.tutor.subject} with ${matchedTutor.tutor.name}`,
+            start: startTime,
+            end: endTime,
+            body: `Peer tutoring session for ${matchedTutor.tutor.subject}.\n\nTutor: ${matchedTutor.tutor.name}\nExpertise: ${matchedTutor.tutor.expertise}`,
+            location: 'Online (Teams)',
+          });
+          setCalendarEventId(event.id || null);
+        } catch (error) {
+          console.error('Failed to create calendar event:', error);
+        }
+      }
+    }
+    
+    setCreatingEvent(false);
+    setTimeout(() => setScreen('session'), 2500);
+  };
+
+  const handleEndSession = () => {
+    setFeedbackRating(0);
+    setScreen('feedback');
+  };
+
+  const handleFeedback = (rating: number) => {
+    setFeedbackRating(rating);
+    showToast(rating >= 4 ? 'Thanks for the feedback!' : 'Thanks, we\'ll work on improving');
+    
+    setTimeout(() => {
+      setScreen('home');
+      setQuery('');
+      setMatchedTutor(null);
+      setSelectedTime(null);
+      setCalendarEventId(null);
+    }, 800);
+  };
+
+  const handleSeeOthers = () => {
+    const otherTutors = tutors.filter(t => t.id !== matchedTutor?.tutor.id);
+    const scored = otherTutors.map(tutor => ({
+      tutor,
+      relevance: tutor.rating * 10 + (tutor.available ? 20 : 0),
+      reason: `${tutor.rating}★ • ${tutor.sessionsCompleted} sessions`,
+    }));
+    scored.sort((a, b) => b.relevance - a.relevance);
+    setMatchedTutor(scored[0]);
+  };
+
+  const getLastTutor = () => {
+    if (!prefs.lastTutorId) return null;
+    return tutors.find(t => t.id === prefs.lastTutorId) || null;
+  };
+
+  // ============================================
+  // WELCOME - Microsoft Login
+  // ============================================
+  if (screen === 'welcome' || !isAuthenticated) {
     return (
-      <main className="min-h-screen bg-gradient-hero flex items-center justify-center px-6">
-        <div className="text-center w-full max-w-md animate-in fade-in slide-in-from-bottom-4 duration-700">
-          <div className="w-20 h-20 mx-auto mb-8 rounded-3xl bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center shadow-lg shadow-blue-500/30 animate-float">
+      <main className="min-h-screen flex flex-col items-center justify-center px-6 bg-white safe-bottom">
+        <div className="w-full max-w-sm text-center animate-fade-in">
+          <div className="w-20 h-20 mx-auto mb-8 rounded-[22px] bg-gradient-to-br from-neutral-900 to-neutral-700 flex items-center justify-center shadow-lg">
             <span className="text-4xl">📚</span>
           </div>
-          <h1 className="text-4xl md:text-5xl font-semibold text-gray-900 mb-3 tracking-tight">
-            Find Your Tutor
+          
+          <h1 className="text-3xl font-semibold text-neutral-900 mb-3 tracking-tight">
+            Peer Tutoring
           </h1>
-          <p className="text-lg text-gray-500 mb-10">
-            Expert help is just a tap away
+          <p className="text-neutral-500 mb-12 text-lg">
+            Get instant help from top students
           </p>
-          <form onSubmit={handleLandingSubmit} className="space-y-4">
-            <input
-              type="text"
-              name="name"
-              required
-              autoFocus
-              placeholder="What's your name?"
-              className="w-full px-6 py-4 border border-gray-200 rounded-2xl focus:border-blue-500 focus:ring-4 focus:ring-blue-500/10 outline-none transition-all text-gray-900 bg-white text-center text-lg font-medium placeholder:text-gray-400 placeholder:font-normal shadow-sm"
-            />
-            <button
-              type="submit"
-              className="w-full px-8 py-4 bg-gray-900 text-white font-semibold rounded-2xl hover:bg-gray-800 transition-all duration-200 text-lg shadow-lg shadow-gray-900/20 hover:shadow-xl hover:shadow-gray-900/25 active:scale-[0.98] btn-press"
-            >
-              Get Started
-            </button>
-          </form>
+          
+          <button
+            onClick={handleLogin}
+            disabled={inProgress}
+            className="w-full py-4 bg-neutral-900 text-white font-medium rounded-2xl flex items-center justify-center gap-3 transition-all hover:bg-neutral-800 active:scale-[0.98] disabled:opacity-50 shadow-lg shadow-neutral-900/20"
+          >
+            {inProgress ? (
+              <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+            ) : (
+              <svg className="w-5 h-5" viewBox="0 0 21 21" fill="none">
+                <rect x="1" y="1" width="9" height="9" fill="#f25022"/>
+                <rect x="11" y="1" width="9" height="9" fill="#7fba00"/>
+                <rect x="1" y="11" width="9" height="9" fill="#00a4ef"/>
+                <rect x="11" y="11" width="9" height="9" fill="#ffb900"/>
+              </svg>
+            )}
+            {inProgress ? 'Signing in...' : 'Continue with Microsoft'}
+          </button>
+          
+          <p className="mt-6 text-sm text-neutral-400">
+            Sign in with your school account
+          </p>
         </div>
       </main>
     );
   }
 
-  // Landing Screen - Subject Selection
-  if (showLanding && onboardingStep === 'subjects') {
+  // ============================================
+  // HOME - Main Input with User Info
+  // ============================================
+  if (screen === 'home') {
+    const availableCount = getAvailableCount();
+    const lastTutor = getLastTutor();
+    
     return (
-      <main className="min-h-screen bg-gradient-hero flex items-center justify-center px-6 py-12">
-        <div className="w-full max-w-lg animate-in fade-in slide-in-from-bottom-4 duration-700">
-          <div className="text-center mb-10">
-            <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-500 flex items-center justify-center shadow-lg shadow-emerald-500/30">
-              <span className="text-3xl">✨</span>
+      <main className="min-h-screen flex flex-col bg-white">
+        {/* User Profile Header */}
+        <header className="px-6 py-5 border-b border-neutral-100">
+          <div className="max-w-xl mx-auto flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="avatar avatar-md bg-gradient-to-br from-blue-500 to-purple-600 text-white">
+                {user?.name?.charAt(0).toUpperCase() || '?'}
+              </div>
+              <div>
+                <p className="font-medium text-neutral-900 leading-tight">{user?.name}</p>
+                <p className="text-sm text-neutral-400">{user?.email}</p>
+              </div>
             </div>
-            <h1 className="text-3xl md:text-4xl font-semibold text-gray-900 mb-3 tracking-tight">
-              Hey {userInfo.name}!
-            </h1>
-            <p className="text-gray-500 text-lg">
-              Pick up to 3 subjects to personalize your experience
-            </p>
-          </div>
-          
-          <div className="grid grid-cols-2 gap-3 mb-10">
-            {subjectsWithTutors.slice(0, 12).map(({ subject }, index) => {
-              const isSelected = tempSelectedSubjects.includes(subject);
-              return (
-                <button
-                  key={subject}
-                  onClick={() => toggleSubject(subject)}
-                  className={`p-4 rounded-2xl text-left transition-all duration-200 active:scale-[0.97] btn-press animate-in fade-in slide-up ${
-                    isSelected 
-                      ? 'bg-gray-900 text-white shadow-lg shadow-gray-900/20' 
-                      : 'bg-white text-gray-900 hover:bg-gray-50 border border-gray-200 hover:border-gray-300 shadow-sm'
-                  }`}
-                  style={{ animationDelay: `${index * 30}ms` }}
-                >
-                  <span className="text-2xl block mb-2">{subjectIcons[subject] || '📖'}</span>
-                  <span className="font-medium text-sm">{subject}</span>
-                  {isSelected && (
-                    <span className="absolute top-3 right-3 w-5 h-5 bg-white rounded-full flex items-center justify-center">
-                      <svg className="w-3 h-3 text-gray-900" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
-                      </svg>
-                    </span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="space-y-3">
             <button
-              onClick={() => handleSubjectsSubmit(tempSelectedSubjects)}
-              disabled={tempSelectedSubjects.length === 0}
-              className="w-full px-8 py-4 bg-gray-900 text-white font-semibold rounded-2xl hover:bg-gray-800 transition-all duration-200 text-lg shadow-lg shadow-gray-900/20 disabled:opacity-40 disabled:cursor-not-allowed disabled:shadow-none active:scale-[0.98] btn-press"
+              onClick={handleLogout}
+              className="text-sm text-neutral-400 hover:text-neutral-600 transition-colors py-2 px-3 -mr-3 rounded-lg hover:bg-neutral-100"
             >
-              Continue
-              {tempSelectedSubjects.length > 0 && (
-                <span className="ml-2 px-2 py-0.5 bg-white/20 rounded-full text-sm">
-                  {tempSelectedSubjects.length}
+              Sign out
+            </button>
+          </div>
+        </header>
+
+        {/* Main Content */}
+        <div className="flex-1 flex flex-col items-center justify-center px-6 py-12">
+          <div className="w-full max-w-xl">
+            {/* Quick Rebook Card */}
+            {lastTutor && (
+              <div className="mb-8 animate-fade-in">
+                <button
+                  onClick={handleQuickRebook}
+                  className="w-full p-4 bg-neutral-50 rounded-2xl flex items-center gap-4 transition-all hover:bg-neutral-100 active:scale-[0.99] group"
+                >
+                  <div 
+                    className="avatar avatar-md text-white"
+                    style={{ background: lastTutor.avatarColor }}
+                  >
+                    {getInitials(lastTutor.name)}
+                  </div>
+                  <div className="flex-1 text-left">
+                    <p className="text-sm text-neutral-500">Book again</p>
+                    <p className="font-medium text-neutral-900">{lastTutor.name} • {lastTutor.subject}</p>
+                  </div>
+                  <svg className="w-5 h-5 text-neutral-300 group-hover:text-neutral-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                  </svg>
+                </button>
+              </div>
+            )}
+
+            <div className="animate-slide-up">
+              <h2 className="text-2xl sm:text-3xl font-semibold text-neutral-900 text-center mb-8 tracking-tight">
+                What do you need help with?
+              </h2>
+              
+              <div className="relative">
+                <input
+                  ref={inputRef}
+                  type="text"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && handleSubmit()}
+                  placeholder={PLACEHOLDERS[placeholderIndex]}
+                  className="w-full px-6 py-5 text-lg sm:text-xl bg-white border-2 border-neutral-200 rounded-2xl focus:border-neutral-900 transition-all placeholder:text-neutral-300 outline-none"
+                />
+                <button
+                  onClick={handleSubmit}
+                  disabled={!query.trim()}
+                  className={`absolute right-3 top-1/2 -translate-y-1/2 w-11 h-11 rounded-xl flex items-center justify-center transition-all ${
+                    query.trim() 
+                      ? 'bg-neutral-900 text-white hover:bg-neutral-800 active:scale-95 shadow-md' 
+                      : 'bg-neutral-100 text-neutral-300'
+                  }`}
+                >
+                  <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14 5l7 7m0 0l-7 7m7-7H3" />
+                  </svg>
+                </button>
+              </div>
+
+              <p className="text-center text-sm text-neutral-400 mt-6">
+                <span className="inline-flex items-center gap-2">
+                  <span className="status-dot status-dot-online status-dot-pulse"></span>
+                  {availableCount} tutors available now
                 </span>
+              </p>
+            </div>
+          </div>
+        </div>
+        
+        {/* Toasts */}
+        {toasts.map(toast => (
+          <ToastNotification key={toast.id} toast={toast} onDismiss={() => dismissToast(toast.id)} />
+        ))}
+      </main>
+    );
+  }
+
+  // ============================================
+  // MATCHING
+  // ============================================
+  if (screen === 'matching') {
+    return (
+      <main className="min-h-screen flex flex-col items-center justify-center px-6 bg-white">
+        <div className="text-center animate-fade-in">
+          <div className="w-14 h-14 mx-auto mb-8 rounded-full border-[3px] border-neutral-200 border-t-neutral-900 animate-spin"></div>
+          <p className="text-lg text-neutral-500">Finding your perfect match...</p>
+        </div>
+      </main>
+    );
+  }
+
+  // ============================================
+  // TUTOR
+  // ============================================
+  if (screen === 'tutor' && matchedTutor) {
+    const { tutor } = matchedTutor;
+    const isAvailableNow = tutor.available && tutor.availableIn === 'Available now';
+    const icon = subjectIcons[tutor.subject] || '📚';
+
+    return (
+      <main className="min-h-screen flex flex-col px-6 py-8 bg-white safe-bottom">
+        <button
+          onClick={() => { setScreen('home'); setQuery(''); }}
+          className="self-start p-2 -ml-2 text-neutral-400 hover:text-neutral-900 transition-colors rounded-lg hover:bg-neutral-100"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+
+        <div className="flex-1 flex flex-col items-center justify-center max-w-md mx-auto w-full">
+          <div className="animate-slide-up text-center">
+            <div 
+              className="avatar avatar-xl text-white mx-auto mb-6 shadow-xl"
+              style={{ background: tutor.avatarColor }}
+            >
+              {getInitials(tutor.name)}
+            </div>
+
+            <h1 className="text-3xl font-semibold text-neutral-900 mb-1 tracking-tight">{tutor.name}</h1>
+            
+            <p className="text-neutral-500 mb-6 flex items-center justify-center gap-2">
+              <span>{icon}</span>
+              <span>{tutor.subject}</span>
+              <span className="text-neutral-300">•</span>
+              <span className="text-amber-500">★</span>
+              <span>{tutor.rating}</span>
+            </p>
+
+            <p className="text-neutral-600 mb-8 leading-relaxed max-w-xs mx-auto">
+              {tutor.bio}
+            </p>
+
+            <button
+              onClick={() => handleBook(isAvailableNow)}
+              className={`w-full py-4 text-white text-lg font-medium rounded-2xl transition-all active:scale-[0.98] shadow-lg ${
+                isAvailableNow 
+                  ? 'bg-emerald-600 hover:bg-emerald-700 shadow-emerald-600/20' 
+                  : 'bg-neutral-900 hover:bg-neutral-800 shadow-neutral-900/20'
+              }`}
+            >
+              {isAvailableNow ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="w-2 h-2 bg-white rounded-full animate-pulse"></span>
+                  Start now
+                </span>
+              ) : (
+                `Book for ${tutor.availableIn?.replace('In ', '').replace('Tomorrow', 'tomorrow')}`
               )}
             </button>
+
             <button
-              onClick={handleSkipSubjects}
-              className="w-full px-8 py-3 text-gray-500 font-medium rounded-2xl hover:bg-gray-100 transition-all duration-200"
+              onClick={handleSeeOthers}
+              className="mt-4 py-3 text-sm text-neutral-400 hover:text-neutral-600 transition-colors"
             >
-              Skip for now
+              See other tutors
             </button>
           </div>
         </div>
@@ -295,346 +593,241 @@ export default function Home() {
     );
   }
 
-  // Main Dashboard View
-  if (!selectedSubject || filteredTutors.length <= 1) {
-    const userFavoriteSubjects = userInfo.favoriteSubjects || [];
-    const favoriteSubjectsData = subjectsWithTutors.filter(s => userFavoriteSubjects.includes(s.subject));
-    const lastBookedTutor = bookingHistory.length > 0 
-      ? tutors.find(t => t.id === bookingHistory[0].tutorId)
-      : null;
-
+  // ============================================
+  // BOOKING
+  // ============================================
+  if (screen === 'booking' && matchedTutor) {
     return (
-      <main className="min-h-screen bg-[#f5f5f7]">
-        <div className="container mx-auto px-5 py-8 max-w-4xl">
-          {/* Header */}
-          <header className="mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <div className="flex items-center justify-between mb-6">
-              <div>
-                <p className="text-sm font-medium text-gray-500 mb-1">Welcome back</p>
-                <h1 className="text-2xl font-semibold text-gray-900 tracking-tight">
-                  {userInfo.name}
-                </h1>
-              </div>
-              <div className="w-10 h-10 rounded-full bg-gradient-to-br from-blue-500 to-indigo-600 flex items-center justify-center text-white font-semibold shadow-lg shadow-blue-500/25">
-                {userInfo.name.charAt(0).toUpperCase()}
-              </div>
+      <main className="min-h-screen flex flex-col px-6 py-8 bg-white safe-bottom">
+        <button
+          onClick={() => setScreen('tutor')}
+          className="self-start p-2 -ml-2 text-neutral-400 hover:text-neutral-900 transition-colors rounded-lg hover:bg-neutral-100"
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+          </svg>
+        </button>
+
+        <div className="flex-1 flex flex-col items-center justify-center max-w-md mx-auto w-full">
+          <div className="animate-slide-up w-full text-center">
+            <div className="badge badge-success mb-6">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+              Synced with your calendar
             </div>
-            <SearchBar 
-              onSelectTutor={handleSearchSelectTutor}
-              onSelectSubject={handleSearchSelectSubject}
-            />
-          </header>
+            
+            <h1 className="text-2xl font-semibold text-neutral-900 mb-2 tracking-tight">Pick a time</h1>
+            <p className="text-neutral-500 mb-8">
+              Session with <span className="font-medium text-neutral-700">{matchedTutor.tutor.name}</span>
+            </p>
 
-          {/* Quick Rebook */}
-          {lastBookedTutor && (
-            <section className="mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500" style={{ animationDelay: '50ms' }}>
-              <div className="bg-gradient-to-r from-gray-900 to-gray-800 rounded-3xl p-5 text-white shadow-xl shadow-gray-900/20">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-4">
-                    <div 
-                      className="w-14 h-14 rounded-2xl flex items-center justify-center text-white text-xl font-bold shadow-lg"
-                      style={{ background: lastBookedTutor.avatarColor }}
-                    >
-                      {getInitials(lastBookedTutor.name)}
-                    </div>
-                    <div>
-                      <p className="text-gray-400 text-sm mb-0.5">Book again with</p>
-                      <p className="font-semibold text-lg">{lastBookedTutor.name}</p>
-                      <p className="text-sm text-gray-400">{lastBookedTutor.subject}</p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => handleBookTutor(lastBookedTutor)}
-                    className="px-6 py-3 bg-white text-gray-900 font-semibold rounded-xl hover:bg-gray-100 transition-all active:scale-[0.97] btn-press shadow-lg"
-                  >
-                    Rebook
-                  </button>
-                </div>
+            {loadingSlots ? (
+              <div className="flex flex-col items-center py-16">
+                <div className="w-10 h-10 border-[3px] border-neutral-200 border-t-neutral-900 rounded-full animate-spin mb-4" />
+                <p className="text-neutral-500">Checking your calendar...</p>
               </div>
-            </section>
-          )}
-
-          {/* Recent Tutors */}
-          {recentTutors.length > 0 && (
-            <section className="mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500" style={{ animationDelay: '100ms' }}>
-              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 px-1">Recent</h2>
-              <div className="flex gap-4 overflow-x-auto pb-2 -mx-5 px-5 scrollbar-hide">
-                {recentTutors.map((tutor, index) => (
+            ) : (
+              <div className="w-full space-y-2">
+                {freeSlots.map((slot, index) => (
                   <button
-                    key={tutor.id}
-                    onClick={() => handleViewProfile(tutor)}
-                    className="flex-shrink-0 bg-white rounded-2xl p-4 shadow-sm hover:shadow-md border border-gray-100 hover:border-gray-200 transition-all active:scale-[0.98] btn-press w-36 animate-in fade-in slide-up"
-                    style={{ animationDelay: `${100 + index * 50}ms` }}
+                    key={index}
+                    onClick={() => handleTimeSelect(slot)}
+                    className={`w-full p-4 bg-neutral-50 rounded-xl text-left transition-all hover:bg-neutral-100 active:scale-[0.99] flex items-center justify-between group animate-fade-in stagger-${index + 1}`}
+                    style={{ animationFillMode: 'both' }}
                   >
-                    <div 
-                      className="w-12 h-12 rounded-xl flex items-center justify-center text-white text-lg font-bold mb-3 shadow-md"
-                      style={{ background: tutor.avatarColor }}
-                    >
-                      {getInitials(tutor.name)}
+                    <div className="flex items-center gap-3">
+                      <div className="w-10 h-10 rounded-lg bg-white flex items-center justify-center text-neutral-400 shadow-sm">
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                      </div>
+                      <div>
+                        <span className="font-medium text-neutral-900">{formatSlotTime(slot)}</span>
+                        <p className="text-sm text-neutral-400">1 hour session</p>
+                      </div>
                     </div>
-                    <p className="font-semibold text-gray-900 text-sm truncate">{tutor.name}</p>
-                    <p className="text-xs text-gray-500 truncate">{tutor.subject}</p>
+                    <svg className="w-5 h-5 text-neutral-300 group-hover:text-neutral-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                    </svg>
                   </button>
                 ))}
-              </div>
-            </section>
-          )}
-
-          {/* Your Subjects */}
-          {favoriteSubjectsData.length > 0 && (
-            <section className="mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500" style={{ animationDelay: '150ms' }}>
-              <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 px-1">Your Subjects</h2>
-              <div className="grid grid-cols-3 gap-3">
-                {favoriteSubjectsData.map(({ subject, topTutor, tutorCount }, index) => (
-                  <button
-                    key={subject}
-                    onClick={() => handleSubjectClick({ subject, tutorCount, tutors: [], topTutor, category: topTutor.category })}
-                    className="bg-white rounded-2xl p-4 text-left shadow-sm hover:shadow-md border border-gray-100 hover:border-gray-200 transition-all duration-200 active:scale-[0.98] btn-press animate-in fade-in slide-up"
-                    style={{ animationDelay: `${150 + index * 30}ms` }}
-                  >
-                    <span className="text-2xl block mb-2">{subjectIcons[subject] || '📖'}</span>
-                    <div className="font-semibold text-gray-900 text-sm truncate">{subject}</div>
-                    <div className="text-xs text-gray-400 mt-1">{tutorCount} tutor{tutorCount > 1 ? 's' : ''}</div>
-                  </button>
-                ))}
-              </div>
-            </section>
-          )}
-
-          {/* Popular */}
-          <section className="mb-8 animate-in fade-in slide-in-from-bottom-4 duration-500" style={{ animationDelay: '200ms' }}>
-            <h2 className="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-4 px-1">Popular</h2>
-            <div className="flex gap-2 overflow-x-auto pb-2 -mx-5 px-5 scrollbar-hide">
-              {popularSubjects.map((subject, index) => (
-                <button
-                  key={subject}
-                  onClick={() => handleSearchSelectSubject(subject)}
-                  className="flex-shrink-0 px-4 py-2.5 bg-white rounded-full border border-gray-200 text-sm font-medium text-gray-700 hover:bg-gray-50 hover:border-gray-300 transition-all active:scale-[0.97] btn-press shadow-sm animate-in fade-in slide-up"
-                  style={{ animationDelay: `${200 + index * 30}ms` }}
-                >
-                  <span className="mr-1.5">{subjectIcons[subject]}</span>
-                  {subject}
-                </button>
-              ))}
-            </div>
-          </section>
-
-          {/* Category Tabs */}
-          <div className="mb-6 animate-in fade-in duration-500" style={{ animationDelay: '250ms' }}>
-            <div className="flex gap-2 overflow-x-auto pb-2 -mx-5 px-5 scrollbar-hide">
-              {(Object.keys(CATEGORY_LABELS) as CategoryFilter[]).map((cat) => (
-                <button
-                  key={cat}
-                  onClick={() => setCategoryFilter(cat)}
-                  className={`px-5 py-2.5 rounded-full font-medium text-sm whitespace-nowrap transition-all duration-200 btn-press ${
-                    categoryFilter === cat
-                      ? 'bg-gray-900 text-white shadow-lg shadow-gray-900/20'
-                      : 'bg-white text-gray-600 hover:bg-gray-50 border border-gray-200 hover:border-gray-300'
-                  }`}
-                >
-                  {CATEGORY_LABELS[cat]}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          {/* Subject Grid */}
-          <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-            {filteredSubjects.map(({ subject, tutorCount, topTutor }, index) => {
-              const icon = subjectIcons[subject] || '📖';
-              
-              return (
-                <button
-                  key={subject}
-                  onClick={() => handleSubjectClick({ subject, tutorCount, tutors: [], topTutor, category: topTutor.category })}
-                  className="bg-white rounded-2xl p-5 text-left shadow-sm hover:shadow-md border border-gray-100 hover:border-gray-200 transition-all duration-200 active:scale-[0.98] btn-press animate-in fade-in slide-up group"
-                  style={{ animationDelay: `${300 + index * 20}ms` }}
-                >
-                  <span className="text-3xl block mb-3 group-hover:scale-110 transition-transform">{icon}</span>
-                  <div className="font-semibold text-gray-900 mb-2">{subject}</div>
-                  <div className="flex items-center gap-2">
-                    <div 
-                      className="w-6 h-6 rounded-full flex items-center justify-center text-white text-[11px] font-bold shadow-sm"
-                      style={{ background: topTutor.avatarColor }}
-                    >
-                      {getInitials(topTutor.name)}
+                
+                {freeSlots.length === 0 && (
+                  <div className="text-center py-12">
+                    <div className="w-12 h-12 mx-auto mb-4 rounded-full bg-neutral-100 flex items-center justify-center">
+                      <svg className="w-6 h-6 text-neutral-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                      </svg>
                     </div>
-                    <span className="text-sm text-gray-500">{topTutor.name}</span>
-                    {tutorCount > 1 && (
-                      <span className="text-sm text-gray-400">+{tutorCount - 1}</span>
-                    )}
+                    <p className="text-neutral-500">No free slots found</p>
+                    <p className="text-sm text-neutral-400 mt-1">Try again later</p>
                   </div>
-                </button>
-              );
-            })}
-          </div>
-          
-          {filteredSubjects.length === 0 && (
-            <div className="text-center py-16">
-              <div className="w-16 h-16 mx-auto mb-4 rounded-2xl bg-gray-100 flex items-center justify-center">
-                <span className="text-3xl">🔍</span>
+                )}
               </div>
-              <p className="text-gray-500 font-medium">No subjects in this category</p>
-            </div>
-          )}
-
-          {/* Bottom padding for mobile */}
-          <div className="h-8"></div>
+            )}
+          </div>
         </div>
-
-        {/* Tutor Profile Modal */}
-        {viewingTutor && (
-          <TutorProfile
-            tutor={viewingTutor}
-            onClose={() => setViewingTutor(null)}
-            onBook={() => handleBookTutor(viewingTutor)}
-            onInstantBook={viewingTutor.available && viewingTutor.availableIn === 'Available now' ? () => handleBookTutor(viewingTutor, true) : undefined}
-          />
-        )}
-
-        {/* Booking Modal */}
-        {isModalOpen && selectedTutor && (
-          <BookingModal
-            tutor={selectedTutor}
-            onClose={handleCloseModal}
-            userInfo={userInfo}
-            isInstantBook={isInstantBook}
-            onBookingComplete={() => handleBookingComplete(selectedTutor)}
-          />
-        )}
       </main>
     );
   }
 
-  // Tutor Selection View
-  const selectedSubjectData = subjectsWithTutors.find(s => s.subject === selectedSubject);
-  const categoryColor = selectedSubjectData ? categoryColors[selectedSubjectData.category] : categoryColors.stem;
-  const subjectIcon = subjectIcons[selectedSubject] || '📖';
-  const featuredTutor = filteredTutors.reduce((top, current) => 
-    current.rating > top.rating ? current : top
-  );
-  const otherTutors = filteredTutors.filter(t => t.id !== featuredTutor.id);
+  // ============================================
+  // CONFIRMED
+  // ============================================
+  if (screen === 'confirmed' && matchedTutor) {
+    const isNow = selectedTime && (new Date().getTime() - selectedTime.getTime()) < 60000;
 
-  return (
-    <main className="min-h-screen bg-[#f5f5f7]">
-      <div className="container mx-auto px-5 py-8 max-w-2xl">
-        {/* Header */}
-        <div className="mb-8 animate-in fade-in slide-in-from-left-4 duration-300">
-          <button
-            onClick={() => setSelectedSubject(null)}
-            className="flex items-center gap-2 text-gray-500 hover:text-gray-900 mb-4 transition-colors group text-sm font-medium"
+    return (
+      <main className="min-h-screen flex flex-col items-center justify-center px-6 bg-white">
+        <div className="text-center animate-scale-in max-w-sm">
+          <div className="w-20 h-20 mx-auto mb-8 rounded-full bg-emerald-50 flex items-center justify-center">
+            {creatingEvent ? (
+              <div className="w-8 h-8 border-[3px] border-emerald-200 border-t-emerald-500 rounded-full animate-spin" />
+            ) : (
+              <svg className="w-10 h-10 text-emerald-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path className="animate-checkmark" strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M5 13l4 4L19 7" />
+              </svg>
+            )}
+          </div>
+          
+          <h1 className="text-2xl font-semibold text-neutral-900 mb-2 tracking-tight">
+            {creatingEvent ? 'Adding to calendar...' : isNow ? 'Starting now' : 'You\'re booked!'}
+          </h1>
+          <p className="text-neutral-500 mb-6">
+            {isNow ? 'Connecting you with ' : 'Session with '}<span className="font-medium text-neutral-700">{matchedTutor.tutor.name}</span>
+          </p>
+          
+          {!creatingEvent && selectedTime && !isNow && (
+            <div className="inline-flex items-center gap-2 px-5 py-3 bg-neutral-100 rounded-full text-sm font-medium text-neutral-700">
+              <svg className="w-4 h-4 text-neutral-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+              </svg>
+              {formatSlotTime(selectedTime)}
+            </div>
+          )}
+          
+          {!creatingEvent && calendarEventId && (
+            <p className="text-sm text-emerald-600 mt-6 flex items-center justify-center gap-1.5 font-medium">
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+              </svg>
+              Added to your Outlook calendar
+            </p>
+          )}
+        </div>
+      </main>
+    );
+  }
+
+  // ============================================
+  // SESSION
+  // ============================================
+  if (screen === 'session' && matchedTutor) {
+    const { tutor } = matchedTutor;
+
+    return (
+      <main className="min-h-screen bg-neutral-900 flex flex-col safe-bottom">
+        <div className="flex-1 relative flex items-center justify-center">
+          {/* Ambient glow */}
+          <div 
+            className="absolute w-64 h-64 rounded-full opacity-20 blur-3xl"
+            style={{ background: tutor.avatarColor }}
+          />
+          
+          <div 
+            className="relative w-36 h-36 rounded-full flex items-center justify-center text-white text-5xl font-bold shadow-2xl animate-scale-in"
+            style={{ background: tutor.avatarColor }}
           >
-            <svg className="w-5 h-5 group-hover:-translate-x-1 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+            {getInitials(tutor.name)}
+          </div>
+          
+          {/* Top bar */}
+          <div className="absolute top-0 left-0 right-0 p-6 flex items-start justify-between">
+            <div className="text-white/80">
+              <p className="text-sm text-white/60">In session with</p>
+              <p className="font-semibold text-lg">{tutor.name}</p>
+            </div>
+            <div className="px-4 py-2 bg-white/10 rounded-full text-white font-mono text-lg backdrop-blur-sm">
+              {formatTimer(sessionTimer)}
+            </div>
+          </div>
+
+          {/* Subject badge */}
+          <div className="absolute bottom-32 left-1/2 -translate-x-1/2">
+            <div className="px-4 py-2 bg-white/10 rounded-full text-white/80 text-sm backdrop-blur-sm">
+              {tutor.subject}
+            </div>
+          </div>
+        </div>
+
+        {/* Controls */}
+        <div className="p-6 flex items-center justify-center gap-4">
+          <button className="w-14 h-14 bg-white/10 rounded-full flex items-center justify-center text-white hover:bg-white/20 transition-all active:scale-95 backdrop-blur-sm">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
             </svg>
-            Back
           </button>
-          <div className="flex items-center gap-3">
-            <div className="w-14 h-14 rounded-2xl bg-white shadow-sm border border-gray-100 flex items-center justify-center">
-              <span className="text-3xl">{subjectIcon}</span>
-            </div>
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900">{selectedSubject}</h1>
-              <p className="text-gray-500 text-sm">{filteredTutors.length} tutors available</p>
-            </div>
-          </div>
+          <button className="w-14 h-14 bg-white/10 rounded-full flex items-center justify-center text-white hover:bg-white/20 transition-all active:scale-95 backdrop-blur-sm">
+            <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+            </svg>
+          </button>
+          <button 
+            onClick={handleEndSession}
+            className="w-16 h-16 bg-red-500 rounded-full flex items-center justify-center text-white hover:bg-red-600 active:scale-95 transition-all shadow-lg shadow-red-500/30"
+          >
+            <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.5} d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
         </div>
+      </main>
+    );
+  }
 
-        {/* Featured Tutor */}
-        <div className="mb-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
-          <div className="bg-white rounded-3xl p-6 shadow-sm border border-gray-100">
-            <div className="flex items-start gap-4 mb-4">
-              <div 
-                className="w-16 h-16 rounded-2xl flex items-center justify-center text-white text-2xl font-bold shadow-lg cursor-pointer hover:scale-105 transition-transform"
-                style={{ background: featuredTutor.avatarColor }}
-                onClick={() => handleViewProfile(featuredTutor)}
-              >
-                {getInitials(featuredTutor.name)}
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 mb-1">
-                  <span className="text-xs font-semibold text-blue-600 bg-blue-50 px-2.5 py-1 rounded-full">★ Top Rated</span>
-                  {featuredTutor.available && (
-                    <span className="text-xs font-medium text-emerald-600 bg-emerald-50 px-2.5 py-1 rounded-full flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                      {featuredTutor.availableIn}
-                    </span>
-                  )}
-                </div>
-                <h2 
-                  className="text-xl font-bold text-gray-900 cursor-pointer hover:text-blue-600 transition-colors"
-                  onClick={() => handleViewProfile(featuredTutor)}
-                >
-                  {featuredTutor.name}
-                </h2>
-                <p className="text-gray-500 text-sm">{featuredTutor.rating} ⭐ • {featuredTutor.sessionsCompleted} sessions</p>
-              </div>
-            </div>
-            
-            <p className="text-gray-600 mb-5 leading-relaxed">"{featuredTutor.bio}"</p>
-            
-            <div className="flex gap-3">
-              <button
-                onClick={() => handleViewProfile(featuredTutor)}
-                className="flex-1 py-3 px-4 rounded-xl font-semibold text-gray-700 bg-gray-100 hover:bg-gray-200 transition-all active:scale-[0.98] btn-press"
-              >
-                View Profile
-              </button>
-              <button
-                onClick={() => handleBookTutor(featuredTutor)}
-                className="flex-1 py-3 px-4 rounded-xl font-semibold text-white bg-gray-900 hover:bg-gray-800 transition-all active:scale-[0.98] btn-press shadow-lg shadow-gray-900/20"
-              >
-                Book Now
-              </button>
-            </div>
+  // ============================================
+  // FEEDBACK
+  // ============================================
+  if (screen === 'feedback' && matchedTutor) {
+    return (
+      <main className="min-h-screen flex flex-col items-center justify-center px-6 bg-white safe-bottom">
+        <div className="text-center max-w-md animate-slide-up">
+          <div className="w-16 h-16 mx-auto mb-6 rounded-2xl bg-neutral-100 flex items-center justify-center">
+            <span className="text-3xl">🎉</span>
           </div>
+          
+          <p className="text-neutral-500 mb-2">Session complete</p>
+          <h1 className="text-2xl font-semibold text-neutral-900 mb-8 tracking-tight">
+            How was your session with {matchedTutor.tutor.name}?
+          </h1>
+
+          <div className="flex items-center justify-center mb-10">
+            <StarRating rating={feedbackRating} onRate={handleFeedback} />
+          </div>
+
+          <button
+            onClick={() => { setMatchedTutor(matchedTutor); setScreen('tutor'); }}
+            className="w-full py-4 bg-neutral-900 text-white text-lg font-medium rounded-2xl hover:bg-neutral-800 active:scale-[0.98] transition-all shadow-lg shadow-neutral-900/20"
+          >
+            Book again with {matchedTutor.tutor.name.split(' ')[0]}
+          </button>
+          
+          <button
+            onClick={() => { setScreen('home'); setQuery(''); setMatchedTutor(null); }}
+            className="mt-3 py-3 text-neutral-500 hover:text-neutral-700 transition-colors"
+          >
+            Back to home
+          </button>
         </div>
+        
+        {/* Toasts */}
+        {toasts.map(toast => (
+          <ToastNotification key={toast.id} toast={toast} onDismiss={() => dismissToast(toast.id)} />
+        ))}
+      </main>
+    );
+  }
 
-        {/* Other Tutors */}
-        {otherTutors.length > 0 && (
-          <div className="space-y-3">
-            <h3 className="text-xs font-semibold text-gray-400 uppercase tracking-wider px-1 mt-6 mb-3">Other Tutors</h3>
-            {otherTutors.map((tutor, index) => (
-              <div
-                key={tutor.id}
-                className="animate-in fade-in slide-in-from-bottom-2"
-                style={{ animationDelay: `${100 + index * 50}ms` }}
-              >
-                <TutorCard 
-                  tutor={tutor} 
-                  onBook={() => handleBookTutor(tutor)} 
-                  onViewProfile={() => handleViewProfile(tutor)}
-                  compact 
-                />
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Bottom padding */}
-        <div className="h-8"></div>
-      </div>
-
-      {/* Tutor Profile Modal */}
-      {viewingTutor && (
-        <TutorProfile
-          tutor={viewingTutor}
-          onClose={() => setViewingTutor(null)}
-          onBook={() => handleBookTutor(viewingTutor)}
-          onInstantBook={viewingTutor.available && viewingTutor.availableIn === 'Available now' ? () => handleBookTutor(viewingTutor, true) : undefined}
-        />
-      )}
-
-      {/* Booking Modal */}
-      {isModalOpen && selectedTutor && (
-        <BookingModal
-          tutor={selectedTutor}
-          onClose={handleCloseModal}
-          userInfo={userInfo}
-          isInstantBook={isInstantBook}
-          onBookingComplete={() => handleBookingComplete(selectedTutor)}
-        />
-      )}
-    </main>
-  );
+  return null;
 }
